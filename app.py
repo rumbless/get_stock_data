@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -26,6 +27,12 @@ app.config['INTERVAL'] = 15  # 轮询间隔（秒）
 FOLLOW_TYPE_USER = 'user'  # 关注用户
 FOLLOW_TYPE_CUBE = 'cube'  # 关注组合
 FOLLOW_TYPE_OTHER = 'other'  # 其他平台（预留）
+
+XQ_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': 'application/json',
+    'Cookie': "u=9696783696;xq_a_token=7cf37d4239b032b7bdfb7011f5ca303e4110c8c7"
+}
 
 
 # ========== 数据库初始化 ==========
@@ -103,7 +110,8 @@ def init_db():
         ''')
 
         # 创建索引
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_global_stocks_platform_user ON global_stock_snapshots (platform, platform_user_id)')
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_global_stocks_platform_user ON global_stock_snapshots (platform, platform_user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_global_stocks_symbol ON global_stock_snapshots (stock_symbol)')
 
         # 全局组合调仓快照表
@@ -119,7 +127,8 @@ def init_db():
         ''')
 
         # 创建索引
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_global_rebalance_platform ON global_rebalance_snapshots (platform, target_symbol)')
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_global_rebalance_platform ON global_rebalance_snapshots (platform, target_symbol)')
 
         # 用户股票订阅表（记录用户关注的股票快照）
         cursor.execute('''
@@ -149,12 +158,11 @@ def init_db():
             )
         ''')
 
-
         db.commit()
 
 
 @app.teardown_appcontext
-def close_db(error):
+def close_db():
     """关闭数据库连接"""
     if hasattr(g, 'db'):
         g.db.close()
@@ -196,13 +204,6 @@ def verify_token(token):
         if not user:
             app.logger.warning(f"无效的用户token: user_id={user_id}, phone={phone}")
             return None
-
-        # 可选：可以在这里更新最后登录时间或其他操作
-        # cursor.execute(
-        #     'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?',
-        #     (user_id,)
-        # )
-        # db.commit()
 
         # 关闭数据库连接
         cursor.close()
@@ -290,24 +291,28 @@ def delete_follow_snapshots(follow_id, follow_type):
     try:
         # 获取关注记录
         cursor.execute('SELECT * FROM follows WHERE id = ?', (follow_id,))
-        follows = cursor.fetchone()
+        f = cursor.fetchone()
 
-        if not follows:
+        if not f:
             return
+
+        user_id = f['user_id']
+        platform = f['platform']
+        target_id = f['target_id']
 
         if follow_type == FOLLOW_TYPE_USER:
             # 删除用户对该雪球用户的所有股票订阅
             cursor.execute(
                 '''DELETE FROM user_stock_subscriptions 
-                   WHERE user_id = ? AND platform_user_id = ?''',
-                (follows['user_id'], follows['target_id'])
+                   WHERE user_id = ? AND platform = ? AND platform_user_id = ?''',
+                (user_id, platform, target_id)
             )
         elif follow_type == FOLLOW_TYPE_CUBE:
             # 删除用户对该组合的所有调仓订阅
             cursor.execute(
                 '''DELETE FROM user_rebalance_subscriptions 
-                   WHERE user_id = ? AND target_symbol = ?''',
-                (follows['user_id'], follows['target_id'])
+                   WHERE user_id = ? AND platform = ? AND target_symbol = ?''',
+                (user_id, platform, target_id)
             )
 
         # 注意：这里不删除全局快照，因为其他用户可能还在关注
@@ -363,9 +368,13 @@ def cleanup_expired_data():
 
 
 # ========== API路由 ==========
-@app.route('/api/register', methods=['POST'])
-def register():
-    """用户注册"""
+# 删除原来的 /api/register 和 /api/login 路由
+# 添加新的 /api/auth 合并接口
+
+@app.route('/api/auth', methods=['POST'])
+def auth():
+    """合并注册/登录接口"""
+    global action
     data = request.get_json()
 
     if not data or not data.get('phone') or not data.get('password'):
@@ -374,75 +383,63 @@ def register():
     phone = data['phone']
     password = data['password']
 
-    db = get_db()
-    cursor = db.cursor()
-
-    # 检查用户是否已存在
-    cursor.execute('SELECT id FROM users WHERE phone = ?', (phone,))
-    if cursor.fetchone():
-        return jsonify({'error': '用户已存在'}), 400
-
-    # 创建新用户
-    password_hash = generate_password_hash(password)
-    cursor.execute(
-        'INSERT INTO users (phone, password_hash) VALUES (?, ?)',
-        (phone, password_hash)
-    )
-    user_id = cursor.lastrowid
-
-    # 生成token
-    token = generate_token(phone, user_id)
-
-    db.commit()
-
-    return jsonify({
-        'message': '注册成功',
-        'token': token,
-        'user_id': user_id
-    }), 201
-
-
-@app.route('/api/login', methods=['POST'])
-def login():
-    """用户登录"""
-    data = request.get_json()
-
-    if not data or not data.get('phone') or not data.get('password'):
-        return jsonify({'error': '手机号和密码不能为空'}), 400
-
-    phone = data['phone']
-    password = data['password']
+    # 验证手机号格式
+    if not re.match(r'^1[3-9]\d{9}$', phone):
+        return jsonify({'error': '手机号格式不正确'}), 400
 
     db = get_db()
     cursor = db.cursor()
 
-    # 查询用户
-    cursor.execute('SELECT id, password_hash FROM users WHERE phone = ?', (phone,))
-    user = cursor.fetchone()
+    try:
+        # 查询用户是否已存在
+        cursor.execute('SELECT id, password_hash FROM users WHERE phone = ?', (phone,))
+        user = cursor.fetchone()
 
-    if not user:
-        return jsonify({'error': '用户不存在'}), 404
+        if user:
+            # 用户存在，验证密码（登录）
+            if not check_password_hash(user['password_hash'], password):
+                return jsonify({'error': '密码错误'}), 401
 
-    # 验证密码
-    if not check_password_hash(user['password_hash'], password):
-        return jsonify({'error': '密码错误'}), 401
+            # 更新最后登录时间
+            cursor.execute(
+                'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?',
+                (user['id'],)
+            )
 
-    # 更新最后登录时间
-    cursor.execute(
-        'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?',
-        (user['id'],)
-    )
+            action = '登录'
+            user_id = user['id']
 
-    # 生成token
-    token = generate_token(phone, user['id'])
+        else:
+            # 用户不存在，创建新用户（注册）
+            password_hash = generate_password_hash(password)
+            cursor.execute(
+                'INSERT INTO users (phone, password_hash) VALUES (?, ?)',
+                (phone, password_hash)
+            )
 
-    db.commit()
+            action = '注册'
+            user_id = cursor.lastrowid
 
-    return jsonify({
-        'message': '登录成功',
-        'token': token,
-        'user_id': user['id']
-    })
+        # 生成token
+        token = generate_token(phone, user_id)
+
+        db.commit()
+
+        return jsonify({
+            'message': f'{action}成功',
+            'token': token,
+            'user_id': user_id,
+            'action': action
+        })
+
+    except Exception as e:
+        db.rollback()
+        app.logger.error(f"{action}失败: {str(e)}")
+
+        if 'UNIQUE constraint' in str(e):
+            return jsonify({'error': '用户已存在'}), 400
+        else:
+            return jsonify({'error': f'{action}失败'}), 500
 
 
 @app.route('/api/search/user', methods=['GET'])
@@ -465,13 +462,7 @@ def search_user():
             'count': count
         }
 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
-            'Cookie': "u=9696783696;xq_a_token=7cf37d4239b032b7bdfb7011f5ca303e4110c8c7"
-        }
-
-        response = requests.get(search_url, params=params, headers=headers)
+        response = requests.get(search_url, params=params, headers=XQ_HEADERS)
 
         if response.status_code == 200:
             data = response.json()
@@ -507,13 +498,7 @@ def search_cube():
             'count': count
         }
 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
-            'Cookie': "u=9696783696;xq_a_token=7cf37d4239b032b7bdfb7011f5ca303e4110c8c7"
-        }
-
-        response = requests.get(search_url, params=params, headers=headers)
+        response = requests.get(search_url, params=params, headers=XQ_HEADERS)
 
         if response.status_code == 200:
             data = response.json()
@@ -763,10 +748,7 @@ class XueqiuMonitor:
 
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Cookie': "u=9696783696;xq_a_token=7cf37d4239b032b7bdfb7011f5ca303e4110c8c7"
-        })
+        self.session.headers.update(XQ_HEADERS)
         self.stock_url = "https://stock.xueqiu.com/v5/stock/portfolio/stock/list.json"
         self.cube_url = "https://xueqiu.com/cubes/rebalancing/history.json"
         self.interval = app.config['INTERVAL']
@@ -805,7 +787,7 @@ class XueqiuMonitor:
             app.logger.error(f"获取组合数据失败 {cube_symbol}: {str(e)}")
             return []
 
-    def check_stock_changes(self, follow_id, platform, platform_user_id, target_name, user_id):
+    def check_stock_changes(self, platform, platform_user_id, target_name):
         """检查股票变化 - 使用全局快照"""
         db = get_db()
         cursor = db.cursor()
@@ -854,14 +836,6 @@ class XueqiuMonitor:
                     (platform, platform_user_id, symbol, stock_name)
                 )
 
-                # 订阅新增的股票（如果用户还没有订阅）
-                cursor.execute(
-                    '''INSERT OR IGNORE INTO user_stock_subscriptions 
-                       (user_id, platform, platform_user_id, stock_symbol) 
-                       VALUES (?, ?, ?, ?)''',
-                    (user_id, platform, platform_user_id, symbol)
-                )
-
                 # 为所有关注该平台用户的用户创建通知
                 cursor.execute(
                     '''SELECT f.user_id 
@@ -873,14 +847,14 @@ class XueqiuMonitor:
                 )
 
                 for row in cursor.fetchall():
-                    target_user_id = row['user_id']
+                    user_id = row['user_id']
 
-                    # 确保该用户订阅了这只股票
+                    # 订阅新增的股票（如果用户还没有订阅）
                     cursor.execute(
                         '''INSERT OR IGNORE INTO user_stock_subscriptions 
                            (user_id, platform, platform_user_id, stock_symbol) 
                            VALUES (?, ?, ?, ?)''',
-                        (target_user_id, platform, platform_user_id, symbol)
+                        (user_id, platform, platform_user_id, symbol)
                     )
 
                     # 只有非首次检查才发通知
@@ -891,9 +865,9 @@ class XueqiuMonitor:
                             '''INSERT INTO notifications 
                                (user_id, type, title, content) 
                                VALUES (?, ?, ?, ?)''',
-                            (target_user_id, 'stock_add', title, content)
+                            (user_id, 'stock_add', title, content)
                         )
-                        app.logger.info(f"用户{target_user_id}: {title} - {content}")
+                        app.logger.info(f"用户{user_id}: {title} - {content}")
 
             # 找出删除的股票
             removed_symbols = previous_stocks.keys() - current_symbols.keys()
@@ -914,32 +888,22 @@ class XueqiuMonitor:
                 )
 
                 for row in cursor.fetchall():
-                    target_user_id = row['user_id']
+                    user_id = row['user_id']
                     title = f"{target_name} 移除自选"
                     content = f"股票: {stock_name} ({symbol})"
                     cursor.execute(
                         '''INSERT INTO notifications 
                            (user_id, type, title, content) 
                            VALUES (?, ?, ?, ?)''',
-                        (target_user_id, 'stock_remove', title, content)
+                        (user_id, 'stock_remove', title, content)
                     )
-                    app.logger.info(f"用户{target_user_id}: {title} - {content}")
+                    app.logger.info(f"用户{user_id}: {title} - {content}")
 
                 # 删除所有用户的订阅
                 cursor.execute(
                     'DELETE FROM user_stock_subscriptions WHERE platform = ? AND platform_user_id = ? AND stock_symbol = ?',
                     (platform, platform_user_id, symbol)
                 )
-
-            # 更新当前用户的订阅（确保用户订阅了当前的所有股票）
-            if current_symbols:
-                for symbol in current_symbols.keys():
-                    cursor.execute(
-                        '''INSERT OR IGNORE INTO user_stock_subscriptions 
-                           (user_id, platform, platform_user_id, stock_symbol) 
-                           VALUES (?, ?, ?, ?)''',
-                        (user_id, platform, platform_user_id, symbol)
-                    )
 
             # 提交事务
             db.commit()
@@ -951,7 +915,7 @@ class XueqiuMonitor:
             import traceback
             app.logger.error(traceback.format_exc())
 
-    def check_cube_rebalance(self, follow_id, platform, target_symbol, target_name, user_id):
+    def check_cube_rebalance(self, platform, target_symbol, target_name):
         """检查组合调仓 - 使用全局快照"""
         db = get_db()
         cursor = db.cursor()
@@ -1015,16 +979,16 @@ class XueqiuMonitor:
                         )
 
                         for row in cursor.fetchall():
-                            target_user_id = row['user_id']
+                            user_id = row['user_id']
                             title = f"{target_name} 调仓"
                             content = f"{stock_name}({stock_symbol}): {prev_weight:.2f}% → {target_weight:.2f}% @ {price}"
                             cursor.execute(
                                 '''INSERT INTO notifications 
                                    (user_id, type, title, content) 
                                    VALUES (?, ?, ?, ?)''',
-                                (target_user_id, 'rebalance', title, content)
+                                (user_id, 'rebalance', title, content)
                             )
-                            app.logger.info(f"用户{target_user_id}: {title} - {content}")
+                            app.logger.info(f"用户{user_id}: {title} - {content}")
 
                         # 订阅这个调仓记录（为所有关注该组合的用户）
                         cursor.execute(
@@ -1037,12 +1001,12 @@ class XueqiuMonitor:
                         )
 
                         for row in cursor.fetchall():
-                            target_user_id = row['user_id']
+                            user_id = row['user_id']
                             cursor.execute(
                                 '''INSERT OR IGNORE INTO user_rebalance_subscriptions 
                                    (user_id, platform, target_symbol, rebalance_id) 
                                    VALUES (?, ?, ?, ?)''',
-                                (target_user_id, platform, target_symbol, rebalance_id)
+                                (user_id, platform, target_symbol, rebalance_id)
                             )
 
                 db.commit()
@@ -1068,7 +1032,7 @@ class XueqiuMonitor:
 
                     # 获取所有关注的用户
                     cursor.execute('''
-                        SELECT f.id, f.platform, f.target_id, f.target_name, f.extra_info, u.id as user_id
+                        SELECT f.platform, f.target_id, f.target_name, f.extra_info, u.id as user_id
                         FROM follows f
                         JOIN users u ON f.user_id = u.id
                         WHERE f.follow_type = ?
@@ -1080,18 +1044,16 @@ class XueqiuMonitor:
                     for row in followed_users:
                         try:
                             self.check_stock_changes(
-                                row['id'],
                                 row['platform'],  # 平台标识
                                 row['target_id'],  # 平台用户ID
-                                row['target_name'],
-                                row['user_id']
+                                row['target_name']
                             )
                         except Exception as e:
                             app.logger.error(f"检查用户{row['target_name']}失败: {str(e)}")
 
                     # 获取所有关注的组合
                     cursor.execute('''
-                        SELECT f.id, f.platform, f.target_id, f.target_name, f.extra_info, u.id as user_id
+                        SELECT f.platform, f.target_id, f.target_name, f.extra_info, u.id as user_id
                         FROM follows f
                         JOIN users u ON f.user_id = u.id
                         WHERE f.follow_type = ?
@@ -1103,11 +1065,9 @@ class XueqiuMonitor:
                     for row in followed_cubes:
                         try:
                             self.check_cube_rebalance(
-                                row['id'],
                                 row['platform'],  # 平台标识
                                 row['target_id'],  # 目标ID
-                                row['target_name'],
-                                row['user_id']
+                                row['target_name']
                             )
                         except Exception as e:
                             app.logger.error(f"检查组合{row['target_name']}失败: {str(e)}")
