@@ -1,0 +1,6 @@
+Flask
+requests
+urllib3
+flask-cors
+PyJwt
+Werkzeug
