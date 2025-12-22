@@ -162,7 +162,7 @@ def init_db():
 
 
 @app.teardown_appcontext
-def close_db():
+def close_db(error):
     """关闭数据库连接"""
     if hasattr(g, 'db'):
         g.db.close()
@@ -1146,3 +1146,4 @@ if __name__ == '__main__':
         debug=False,
         threaded=True
     )
+
