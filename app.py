@@ -1,4 +1,5 @@
 # app.py - 雪球监控后台服务
+import base64
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
 import jwt
+from Crypto.Cipher import AES
 import requests
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
@@ -27,6 +29,8 @@ app.config['INTERVAL'] = 15  # 轮询间隔（秒）
 FOLLOW_TYPE_USER = 'user'  # 关注用户
 FOLLOW_TYPE_CUBE = 'cube'  # 关注组合
 FOLLOW_TYPE_OTHER = 'other'  # 其他平台（预留）
+WX_APPID = 'wx97d6b33f16444587'
+WX_SECRET = '2c2c3f7089c397d7a069d4c545ca6dac'
 
 XQ_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -56,6 +60,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 phone TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
+                openid TEXT UNIQUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_login TIMESTAMP
             )
@@ -549,8 +554,15 @@ def follow():
         extra_info = {}
         if follow_type == FOLLOW_TYPE_USER:
             extra_info = {
-                'xueqiu_uid': data['target_id']
+                'xueqiu_uid': data['target_id'],
             }
+            # 如果是关注用户，先尝试从请求数据中获取avatar_url
+            avatar_url = data.get('avatar_url')
+
+            if avatar_url:
+                # 如果前端提供了头像URL，直接使用
+                extra_info.update({'avatar': avatar_url})
+
         elif follow_type == FOLLOW_TYPE_CUBE:
             extra_info = {
                 'cube_symbol': data['target_id']
@@ -602,7 +614,7 @@ def unfollow(follow_id):
         cursor.execute('DELETE FROM follows WHERE id = ?', (follow_id,))
 
         db.commit()
-        app.logger.info(f"用户{user_id}取消关注: ")
+        app.logger.info(f"用户{user_id}取消关注: {follow_id}")
         return jsonify({
             'message': '取消关注成功',
             'follow_id': follow_id,
@@ -682,7 +694,7 @@ def get_notifications():
     """获取通知列表"""
     user_id = request.user_id
     page = request.args.get('page', 1, type=int)
-    limit = request.args.get('limit', 20, type=int)
+    limit = request.args.get('count', 20, type=int)
     offset = (page - 1) * limit
 
     db = get_db()
@@ -1146,4 +1158,3 @@ if __name__ == '__main__':
         debug=False,
         threaded=True
     )
-
