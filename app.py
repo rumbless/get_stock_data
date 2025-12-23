@@ -29,8 +29,8 @@ app.config['INTERVAL'] = 15  # 轮询间隔（秒）
 FOLLOW_TYPE_USER = 'user'  # 关注用户
 FOLLOW_TYPE_CUBE = 'cube'  # 关注组合
 FOLLOW_TYPE_OTHER = 'other'  # 其他平台（预留）
-WX_APPID = 'wx97d6b33f16444587'
-WX_SECRET = '2c2c3f7089c397d7a069d4c545ca6dac'
+WX_APPID = '1'
+WX_SECRET = '2'
 
 XQ_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
