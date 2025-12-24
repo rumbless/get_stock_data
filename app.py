@@ -61,7 +61,7 @@ def init_db():
                 phone TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 openid TEXT UNIQUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, 'localtime')),
                 last_login TIMESTAMP
             )
         ''')
@@ -76,7 +76,7 @@ def init_db():
                 target_id TEXT NOT NULL,  -- 目标ID（雪球UID/组合symbol等）
                 target_name TEXT NOT NULL,  -- 目标名称
                 extra_info TEXT,  -- 额外信息（JSON格式）
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, 'localtime')),
                 FOREIGN KEY (user_id) REFERENCES users (id),
                 UNIQUE(user_id, follow_type, platform, target_id)
             )
@@ -96,7 +96,7 @@ def init_db():
                 title TEXT NOT NULL,
                 content TEXT NOT NULL,
                 is_read BOOLEAN DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, 'localtime')),
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )
         ''')
@@ -109,7 +109,7 @@ def init_db():
                 platform_user_id TEXT NOT NULL,   -- 平台用户ID
                 stock_symbol TEXT NOT NULL,
                 stock_name TEXT,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_updated TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, 'localtime')),
                 UNIQUE(platform, platform_user_id, stock_symbol)
             )
         ''')
@@ -126,7 +126,7 @@ def init_db():
                 platform TEXT NOT NULL,           -- 平台标识，如 'xueqiu'
                 target_symbol TEXT NOT NULL,      -- 目标ID（如组合symbol）
                 rebalance_id TEXT NOT NULL,       -- 调仓记录ID
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_updated TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, 'localtime')),
                 UNIQUE(platform, target_symbol, rebalance_id)
             )
         ''')
@@ -143,7 +143,7 @@ def init_db():
                 platform TEXT NOT NULL,
                 platform_user_id TEXT NOT NULL,
                 stock_symbol TEXT NOT NULL,
-                subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                subscribed_at TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, 'localtime')),
                 FOREIGN KEY (user_id) REFERENCES users (id),
                 UNIQUE(user_id, platform, platform_user_id, stock_symbol)
             )
@@ -157,7 +157,7 @@ def init_db():
                 platform TEXT NOT NULL,
                 target_symbol TEXT NOT NULL,
                 rebalance_id TEXT NOT NULL,
-                subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                subscribed_at TIMESTAMP DEFAULT (datetime(CURRENT_TIMESTAMP, 'localtime')),
                 FOREIGN KEY (user_id) REFERENCES users (id),
                 UNIQUE(user_id, platform, target_symbol, rebalance_id)
             )
@@ -1158,3 +1158,4 @@ if __name__ == '__main__':
         debug=False,
         threaded=True
     )
+
