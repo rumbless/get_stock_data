@@ -1,5 +1,4 @@
 # app.py - 雪球监控后台服务
-import base64
 import json
 import logging
 import os
@@ -11,17 +10,15 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
 import jwt
-from Crypto.Cipher import AES
 import requests
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-from werkzeug.security import generate_password_hash, check_password_hash
 
 # ========== 配置部分 ==========
 app = Flask(__name__)
 CORS(app)  # 允许跨域请求
 app.config['SECRET_KEY'] = 'your-secret-key-change-this'  # 生产环境请使用强密钥
-app.config['DATABASE'] = 'D:\\sqlite3\\monitor.db'
+app.config['DATABASE'] = 'monitor.db'
 app.config['JWT_EXPIRATION_HOURS'] = 24 * 7  # JWT有效期7天
 app.config['INTERVAL'] = 15  # 轮询间隔（秒）
 
@@ -29,8 +26,14 @@ app.config['INTERVAL'] = 15  # 轮询间隔（秒）
 FOLLOW_TYPE_USER = 'user'  # 关注用户
 FOLLOW_TYPE_CUBE = 'cube'  # 关注组合
 FOLLOW_TYPE_OTHER = 'other'  # 其他平台（预留）
+
+# WX KEY
 WX_APPID = '1'
 WX_SECRET = '2'
+
+# 全局变量存储 access_token 和过期时间
+_access_token = None
+_token_expires_at = 0
 
 XQ_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -378,7 +381,7 @@ def cleanup_expired_data():
 
 @app.route('/api/auth', methods=['POST'])
 def auth():
-    """合并注册/登录接口"""
+    """合并注册/登录接口 - 支持微信登录"""
     global action
     data = request.get_json()
 
@@ -386,40 +389,72 @@ def auth():
         return jsonify({'error': '手机号和密码不能为空'}), 400
 
     phone = data['phone']
-    password = data['password']
+    code = data['password']
 
     # 验证手机号格式
     if not re.match(r'^1[3-9]\d{9}$', phone):
         return jsonify({'error': '手机号格式不正确'}), 400
+
+    # 使用 wx.login 获取的 code 换取 openid
+    wx_login_url = "https://api.weixin.qq.com/sns/jscode2session"
+    wx_params = {
+        'appid': WX_APPID,
+        'secret': WX_SECRET,
+        'js_code': code,
+        'grant_type': 'authorization_code'
+    }
+
+    try:
+        wx_response = requests.get(wx_login_url, params=wx_params)
+        wx_response.raise_for_status()
+        wx_data = wx_response.json()
+
+        if 'openid' not in wx_data:
+            app.logger.error(f"获取微信 openid 失败: {wx_data}")
+            return jsonify({'error': '微信登录失败'}), 400
+
+        openid = wx_data['openid']
+        # session_key = wx_data.get('session_key') # 如果需要，可以存储 session_key
+
+    except Exception as e:
+        app.logger.error(f"调用微信登录接口失败: {str(e)}")
+        return jsonify({'error': '微信登录失败'}), 500
 
     db = get_db()
     cursor = db.cursor()
 
     try:
         # 查询用户是否已存在
-        cursor.execute('SELECT id, password_hash FROM users WHERE phone = ?', (phone,))
+        cursor.execute('SELECT id, phone, openid FROM users WHERE phone = ?', (phone,))
         user = cursor.fetchone()
 
         if user:
-            # 用户存在，验证密码（登录）
-            if not check_password_hash(user['password_hash'], password):
-                return jsonify({'error': '密码错误'}), 401
+            # 用户存在，检查 openid 是否一致
+            if user['openid'] != openid:
+                app.logger.warning(f"用户 {phone}:{user['openid']}:{openid} openid 不一致，登录失败")
+                return jsonify({'error': '账号与微信不匹配'}), 401
+
+            # openid 一致，允许登录
+            action = '登录'
+            user_id = user['id']
 
             # 更新最后登录时间
             cursor.execute(
                 'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?',
-                (user['id'],)
+                (user_id,)
             )
 
-            action = '登录'
-            user_id = user['id']
-
         else:
-            # 用户不存在，创建新用户（注册）
-            password_hash = generate_password_hash(password)
+            # 用户不存在，创建新用户
+            # 注意：这里假设新用户注册时手机号是唯一的，并且 openid 也是唯一的
+            # 如果 openid 已存在，说明该微信账号已被其他手机号注册
+            cursor.execute('SELECT id FROM users WHERE openid = ?', (openid,))
+            if cursor.fetchone():
+                return jsonify({'error': '该微信账号已被其他手机号注册'}), 400
+
             cursor.execute(
-                'INSERT INTO users (phone, password_hash) VALUES (?, ?)',
-                (phone, password_hash)
+                'INSERT INTO users (phone, password_hash, openid) VALUES (?, ?, ?)',
+                (phone, '', openid)
             )
 
             action = '注册'
@@ -445,6 +480,98 @@ def auth():
             return jsonify({'error': '用户已存在'}), 400
         else:
             return jsonify({'error': f'{action}失败'}), 500
+
+
+def get_access_token():
+    """获取微信 access_token"""
+    global _access_token, _token_expires_at
+
+    # 检查缓存的 token 是否过期
+    if _access_token and time.time() < _token_expires_at:
+        return _access_token
+
+    # 获取新的 access_token
+    url = f"https://api.weixin.qq.com/cgi-bin/token"
+    params = {
+        'grant_type': 'client_credential',
+        'appid': WX_APPID,
+        'secret': WX_SECRET
+    }
+
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        if 'access_token' in data:
+            _access_token = data['access_token']
+            # 设置过期时间（预留5分钟缓冲）
+            _token_expires_at = time.time() + data['expires_in'] - 300
+            return _access_token
+        else:
+            app.logger.error(f"获取 access_token 失败: {data}")
+            return None
+
+    except Exception as e:
+        app.logger.error(f"获取 access_token 异常: {str(e)}")
+        return None
+
+
+def send_miniprogram_subscribe_message(user_id, title, content, template_id, page="pages/notification/index"):
+    """发送小程序订阅消息"""
+    access_token = get_access_token()
+    if not access_token:
+        app.logger.error("无法获取 access_token，跳过发送小程序消息")
+        return False
+
+    db = get_db()
+    cursor = db.cursor()
+
+    try:
+        # 根据 user_id 获取用户的 openid
+        cursor.execute("SELECT openid FROM users WHERE id = ?", (user_id,))
+        user_row = cursor.fetchone()
+        if not user_row or not user_row['openid']:
+            app.logger.warning(f"用户 {user_id} 未绑定 openid，无法发送小程序消息")
+            return False
+
+        openid = user_row['openid']
+
+        # 构建消息数据
+        # 注意：这里的数据结构是示例，实际模板字段需要根据你在微信小程序平台申请的模板ID和字段来调整
+        message_data = {
+            "touser": openid,
+            "template_id": template_id,  # 需要在微信小程序平台申请并填入
+            "page": page,  # 点击消息跳转的页面
+            "miniprogram_state": "developer",
+            "lang": "zh_CN",
+            "data": {
+                "thing6": {"value": title},  # 示例字段，具体字段名取决于你的模板
+                "thing10": {"value": content},  # 示例字段，具体字段名取决于你的模板
+                "date4": {"value": datetime.now().strftime("%Y/%m/%d %H:%M:%S")}  # 示例字段，具体字段名取决于你的模板
+            }
+        }
+
+        # 发送消息的 API URL
+        url = f"https://api.weixin.qq.com/cgi-bin/message/subscribe/send?access_token={access_token}"
+
+        response = requests.post(url, json=message_data)
+        response.raise_for_status()
+        result = response.json()
+
+        if result.get('errcode') == 0:
+            app.logger.info(f"小程序消息发送成功: 用户 {user_id}, 标题: {title}, 内容: {content}")
+            return True
+        else:
+            app.logger.error(f"小程序消息发送失败: {result}")
+            return False
+
+    except Exception as e:
+        app.logger.error(f"发送小程序消息异常: {str(e)}")
+        return False
+
+    finally:
+        cursor.close()
 
 
 @app.route('/api/search/user', methods=['GET'])
@@ -880,6 +1007,10 @@ class XueqiuMonitor:
                             (user_id, 'stock_add', title, content)
                         )
                         app.logger.info(f"用户{user_id}: {title} - {content}")
+                        # --- 新增：发送小程序消息 ---
+                        # 假设你申请了一个名为 "股票变动提醒" 的订阅消息模板，ID 为 "YOUR_TEMPLATE_ID_1"
+                        # 请将 "YOUR_TEMPLATE_ID_1" 替换为实际的模板ID
+                        send_miniprogram_subscribe_message(user_id, title, content, "3aXpBiIof06R31x0_7qHZTtnxTabJgfa4aFsra7CLMY")
 
             # 找出删除的股票
             removed_symbols = previous_stocks.keys() - current_symbols.keys()
@@ -910,6 +1041,9 @@ class XueqiuMonitor:
                         (user_id, 'stock_remove', title, content)
                     )
                     app.logger.info(f"用户{user_id}: {title} - {content}")
+
+                    # --- 新增：发送小程序消息 ---
+                    send_miniprogram_subscribe_message(user_id, title, content, "3aXpBiIof06R31x0_7qHZTtnxTabJgfa4aFsra7CLMY")
 
                 # 删除所有用户的订阅
                 cursor.execute(
@@ -1001,6 +1135,11 @@ class XueqiuMonitor:
                                 (user_id, 'rebalance', title, content)
                             )
                             app.logger.info(f"用户{user_id}: {title} - {content}")
+
+                            # --- 新增：发送小程序消息 ---
+                            # 假设你申请了一个名为 "组合调仓提醒" 的订阅消息模板，ID 为 "YOUR_TEMPLATE_ID_2"
+                            # 请将 "YOUR_TEMPLATE_ID_2" 替换为实际的模板ID
+                            send_miniprogram_subscribe_message(user_id, title, content, "3aXpBiIof06R31x0_7qHZTtnxTabJgfa4aFsra7CLMY")
 
                         # 订阅这个调仓记录（为所有关注该组合的用户）
                         cursor.execute(
@@ -1158,4 +1297,3 @@ if __name__ == '__main__':
         debug=False,
         threaded=True
     )
-
